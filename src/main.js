@@ -231,9 +231,11 @@ function baselineFromPublished(published) {
   return baseline;
 }
 
+// La reference est liee a la version installee : si elle ne correspond plus (autre dossier,
+// mise a jour interrompue), elle est ignoree et retelechargee avec la release.
 function writeBaseline(baseline) {
   fs.mkdirSync(path.dirname(manifestFile), { recursive: true });
-  fs.writeFileSync(manifestFile, JSON.stringify(baseline), 'utf8');
+  fs.writeFileSync(manifestFile, JSON.stringify({ version: getLocalVersion(), files: baseline }), 'utf8');
 }
 
 function saveManifestBaseline(published) {
@@ -242,7 +244,9 @@ function saveManifestBaseline(published) {
 
 function loadManifestBaseline() {
   try {
-    return JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+    const stored = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+    if (!stored || !stored.files || stored.version !== getLocalVersion()) return null;
+    return stored.files;
   } catch (e) {
     return null;
   }
@@ -293,24 +297,34 @@ function pruneToManifest(published) {
   removeEmptyDirs(installDir);
 }
 
+// Retourne true si le dossier ne contient plus aucun fichier (recursivement).
 function removeEmptyDirs(dir) {
   let entries;
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true });
   } catch (e) {
-    return;
+    return false;
   }
+  let empty = true;
   for (const entry of entries) {
     if (entry.isDirectory()) {
       const full = path.join(dir, entry.name);
-      removeEmptyDirs(full);
-      try {
-        if (fs.readdirSync(full).length === 0) fs.rmdirSync(full);
-      } catch (e) {
-        // ignore
+      if (removeEmptyDirs(full)) {
+        // Sur Windows, la suppression des fichiers peut etre differee (antivirus, indexation) : on laisse
+        // rmSync reessayer plutot que de laisser des dossiers vides derriere nous.
+        try {
+          fs.rmSync(full, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+        } catch (e) {
+          empty = false;
+        }
+      } else {
+        empty = false;
       }
+    } else {
+      empty = false;
     }
   }
+  return empty;
 }
 
 // Applique le fichier _patch.json extrait avec un patch differentiel : suppressions de fichiers
@@ -452,6 +466,7 @@ async function initialize(options) {
 
   if (!forceFull && localVersion === remoteVersion && exeExists) {
     await ensureBaseline(manifestAsset);
+    removeEmptyDirs(installDir);
     return finishReady('A jour !');
   }
 
