@@ -297,34 +297,63 @@ function pruneToManifest(published) {
   removeEmptyDirs(installDir);
 }
 
-// Retourne true si le dossier ne contient plus aucun fichier (recursivement).
-function removeEmptyDirs(dir) {
+// True si le dossier ne contient aucun fichier (recursivement) : simple lecture, aucune suppression.
+function hasNoFiles(dir) {
   let entries;
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true });
   } catch (e) {
     return false;
   }
-  let empty = true;
   for (const entry of entries) {
     if (entry.isDirectory()) {
-      const full = path.join(dir, entry.name);
-      if (removeEmptyDirs(full)) {
-        // Sur Windows, la suppression des fichiers peut etre differee (antivirus, indexation) : on laisse
-        // rmSync reessayer plutot que de laisser des dossiers vides derriere nous.
-        try {
-          fs.rmSync(full, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
-        } catch (e) {
-          empty = false;
-        }
-      } else {
-        empty = false;
-      }
+      if (!hasNoFiles(path.join(dir, entry.name))) return false;
     } else {
-      empty = false;
+      return false;
     }
   }
-  return empty;
+  return true;
+}
+
+// Liste les sous-arborescences sans aucun fichier (restes d'anciennes versions) : on ne garde que
+// les racines de ces arborescences, chacune est ensuite supprimee d'un seul appel recursif.
+function findEmptySubtrees(dir, out) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (e) {
+    return out;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const full = path.join(dir, entry.name);
+    if (hasNoFiles(full)) out.push(full);
+    else findEmptySubtrees(full, out);
+  }
+  return out;
+}
+
+// Sur Windows la suppression des fichiers peut etre differee (antivirus, indexation) : rm reessaie
+// quelques fois plutot que de laisser des dossiers vides derriere nous.
+function removeEmptyDirs(dir) {
+  for (const sub of findEmptySubtrees(dir, [])) {
+    try {
+      fs.rmSync(sub, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    } catch (e) {
+      // on reessaiera au prochain demarrage
+    }
+  }
+}
+
+// Variante asynchrone pour le nettoyage de fond au demarrage (n'immobilise pas l'interface).
+async function removeEmptyDirsAsync(dir) {
+  for (const sub of findEmptySubtrees(dir, [])) {
+    try {
+      await fs.promises.rm(sub, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    } catch (e) {
+      // on reessaiera au prochain demarrage
+    }
+  }
 }
 
 // Applique le fichier _patch.json extrait avec un patch differentiel : suppressions de fichiers
@@ -466,7 +495,7 @@ async function initialize(options) {
 
   if (!forceFull && localVersion === remoteVersion && exeExists) {
     await ensureBaseline(manifestAsset);
-    removeEmptyDirs(installDir);
+    removeEmptyDirsAsync(installDir).catch(() => {});
     return finishReady('A jour !');
   }
 
