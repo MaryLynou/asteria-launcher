@@ -29,6 +29,21 @@ const PATCH_META_NAME = '_patch.json';
 let mainWindow;
 let clientReady = false;
 
+// Journal de bord (userData/launcher.log, ~1 Mo puis rotation) : a demander aux joueurs en cas de souci.
+const logFile = path.join(app.getPath('userData'), 'launcher.log');
+function logLine(level, ...parts) {
+  const text = parts.map((p) => (p instanceof Error ? p.message : String(p))).join(' ');
+  const line = '[' + new Date().toISOString() + '] ' + level + ' ' + text + '\n';
+  try {
+    fs.mkdirSync(path.dirname(logFile), { recursive: true });
+    if (fs.existsSync(logFile) && fs.statSync(logFile).size > 1024 * 1024) fs.renameSync(logFile, logFile + '.old');
+    fs.appendFileSync(logFile, line);
+  } catch (e) {
+    // pas de journal, tant pis
+  }
+  (level === 'ERROR' ? console.error : console.log)(text);
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1000,
@@ -44,9 +59,10 @@ function createWindow() {
   mainWindow.loadFile(path.join(__dirname, 'index.html'));
   mainWindow.once('ready-to-show', () => {
     mainWindow.show();
+    logLine('INFO', 'launcher', app.getVersion(), '| client dir', installDir, '| client', getLocalVersion() || 'aucun');
     initialize().catch((err) => {
       sendStatus('error', 'Erreur : ' + err.message);
-      console.error('[init-error]', err.message);
+      logLine('ERROR', 'init', err);
       if (devAutoQuit) setTimeout(() => app.quit(), 500);
     });
     pollServerInfo();
@@ -55,6 +71,7 @@ function createWindow() {
 }
 
 function sendStatus(phase, message, percent) {
+  if (typeof percent !== 'number' || percent === 0 || percent === 100) logLine('INFO', phase, '-', message);
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('status', { phase, message, percent });
   }
@@ -407,7 +424,7 @@ function checkLauncherUpdate() {
 
     autoUpdater.removeAllListeners();
     autoUpdater.on('error', (err) => {
-      console.error('[launcher-update]', err && err.message ? err.message : err);
+      logLine('ERROR', 'launcher-update', err && err.message ? err.message : err);
       done(false);
     });
     autoUpdater.on('update-not-available', () => done(false));
@@ -453,7 +470,7 @@ async function fetchManifest(asset) {
     const manifest = await fetchJson(asset.browser_download_url);
     return manifest && manifest.files ? manifest : null;
   } catch (e) {
-    console.error('[client-update] manifest illisible :', e.message);
+    logLine('ERROR', 'manifest illisible :', e);
     return null;
   }
 }
@@ -512,7 +529,7 @@ async function initialize(options) {
       await applyPatch(patchAsset, manifest, remoteVersion);
       return finishReady('Mise a jour ' + remoteVersion + ' installee !');
     } catch (err) {
-      console.error('[client-update] patch impossible, retour au telechargement complet :', err.message);
+      logLine('ERROR', 'patch impossible, retour au telechargement complet :', err);
       sendStatus('checking', 'Mise a jour rapide impossible, telechargement complet...');
     }
   }
@@ -599,7 +616,7 @@ async function installFull(fullAsset, manifest, remoteVersion, isRepair) {
 function finishReady(message) {
   clientReady = true;
   sendStatus('ready', message);
-  console.log('[ready]', message, '| client', getLocalVersion());
+  logLine('INFO', 'ready :', message, '| client', getLocalVersion());
   if (devAutoQuit) {
     const check = verifyIntegrity();
     console.log('[integrity]', check.ok ? 'ok' : JSON.stringify(check));
