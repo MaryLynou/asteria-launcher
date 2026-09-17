@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<title>Asteria Launcher</title>
+<style>
+  :root {
+    --color-bg: #05060f;
+    --color-bg-elevated: #0a0d1c;
+    --color-primary: #7c6cff;
+    --color-primary-bright: #a594ff;
+    --color-accent: #ffb84f;
+    --color-cyan: #4fd6d9;
+    --color-green: #4fd98a;
+    --color-red: #ff5c72;
+    --color-text: #e7e9f7;
+    --color-text-dim: #8d92b3;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: var(--color-bg);
+    color: var(--color-text);
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    overflow: hidden;
+    user-select: none;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid rgba(124,108,255,0.35);
+    border-radius: 10px;
+  }
+  .titlebar {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 4px;
+    padding: 8px 10px;
+    -webkit-app-region: drag;
+    flex: 0 0 auto;
+  }
+  .title-btn {
+    -webkit-app-region: no-drag;
+    background: transparent;
+    border: none;
+    color: var(--color-text-dim);
+    font-size: 14px;
+    cursor: pointer;
+    padding: 4px 10px;
+    border-radius: 4px;
+  }
+  .title-btn:hover { background: rgba(255,255,255,0.08); color: #fff; }
+
+  .app {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+  }
+
+  .sidebar {
+    width: 220px;
+    flex: 0 0 auto;
+    background: var(--color-bg-elevated);
+    border-right: 1px solid rgba(124,108,255,0.15);
+    display: flex;
+    flex-direction: column;
+    padding: 18px 14px;
+  }
+  .sidebar-logo {
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    background: linear-gradient(90deg, var(--color-primary-bright), var(--color-cyan));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    margin-bottom: 2px;
+  }
+  .sidebar-tagline {
+    font-size: 11px;
+    color: var(--color-text-dim);
+    letter-spacing: 0.5px;
+    margin-bottom: 22px;
+  }
+  .nav-section-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--color-text-dim);
+    margin: 14px 8px 6px;
+  }
+  .nav-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 10px;
+    border-radius: 8px;
+    font-size: 13px;
+    color: var(--color-text-dim);
+    cursor: pointer;
+    -webkit-app-region: no-drag;
+  }
+  .nav-item:hover { background: rgba(255,255,255,0.06); color: var(--color-text); }
+  .nav-item.active {
+    background: rgba(124,108,255,0.18);
+    color: var(--color-text);
+  }
+  .nav-item.locked {
+    cursor: default;
+    opacity: 0.45;
+  }
+  .nav-item.locked:hover { background: transparent; color: var(--color-text-dim); }
+  .nav-icon { width: 15px; text-align: center; flex: 0 0 auto; }
+
+  .sidebar-footer {
+    margin-top: auto;
+    padding-top: 12px;
+    border-top: 1px solid rgba(255,255,255,0.06);
+    font-size: 11px;
+    color: var(--color-text-dim);
+  }
+  .server-line { display: flex; align-items: center; gap: 7px; margin-bottom: 4px; }
+  .server-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--color-text-dim); flex: 0 0 auto; }
+  .server-dot.online { background: var(--color-green); box-shadow: 0 0 6px var(--color-green); }
+  .server-dot.offline { background: var(--color-red); }
+
+  .main {
+    flex: 1;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 30px;
+    background:
+      radial-gradient(circle at 15% 15%, rgba(124,108,255,0.28), transparent 40%),
+      radial-gradient(circle at 85% 25%, rgba(79,214,217,0.16), transparent 40%),
+      radial-gradient(circle at 50% 100%, rgba(255,184,79,0.10), transparent 45%),
+      var(--color-bg);
+    overflow: hidden;
+  }
+  .stars {
+    position: absolute;
+    inset: 0;
+    background-image:
+      radial-gradient(1px 1px at 20% 30%, rgba(255,255,255,0.6), transparent),
+      radial-gradient(1px 1px at 70% 20%, rgba(255,255,255,0.5), transparent),
+      radial-gradient(1px 1px at 40% 70%, rgba(255,255,255,0.4), transparent),
+      radial-gradient(1px 1px at 85% 65%, rgba(255,255,255,0.5), transparent),
+      radial-gradient(1px 1px at 60% 45%, rgba(255,255,255,0.35), transparent),
+      radial-gradient(1px 1px at 10% 80%, rgba(255,255,255,0.4), transparent);
+    background-repeat: no-repeat;
+    pointer-events: none;
+  }
+
+  .logo {
+    font-size: 42px;
+    font-weight: 700;
+    letter-spacing: 6px;
+    background: linear-gradient(90deg, var(--color-primary-bright), var(--color-cyan));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    margin-bottom: 4px;
+    position: relative;
+  }
+  .subtitle {
+    font-size: 13px;
+    color: var(--color-text-dim);
+    letter-spacing: 2px;
+    margin-bottom: 20px;
+    position: relative;
+  }
+
+  .players-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.1);
+    padding: 6px 16px;
+    border-radius: 999px;
+    font-size: 12px;
+    color: var(--color-text);
+    margin-bottom: 18px;
+    position: relative;
+  }
+
+  .flavor-text {
+    font-size: 12px;
+    font-style: italic;
+    color: var(--color-text-dim);
+    max-width: 480px;
+    margin-bottom: 26px;
+    position: relative;
+    min-height: 32px;
+  }
+
+  #status-message {
+    font-size: 13px;
+    color: var(--color-text);
+    margin-bottom: 10px;
+    min-height: 18px;
+    position: relative;
+  }
+  .progress-track {
+    width: 340px;
+    height: 8px;
+    background: rgba(255,255,255,0.08);
+    border-radius: 6px;
+    overflow: hidden;
+    margin-bottom: 18px;
+    position: relative;
+  }
+  #progress-fill {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, var(--color-primary), var(--color-accent));
+    transition: width 0.25s ease;
+  }
+
+  #play-btn {
+    -webkit-app-region: no-drag;
+    position: relative;
+    width: 280px;
+    padding: 14px 0;
+    border: none;
+    border-radius: 10px;
+    font-size: 16px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    color: #06070f;
+    background: linear-gradient(90deg, var(--color-cyan), var(--color-primary-bright));
+    cursor: pointer;
+  }
+  #play-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+  #play-btn:not(:disabled):hover {
+    filter: brightness(1.08);
+  }
+</style>
+</head>
+<body>
+  <div class="titlebar">
+    <button class="title-btn" id="minimize-btn" title="Reduire">–</button>
+    <button class="title-btn" id="close-btn" title="Fermer">✕</button>
+  </div>
+
+  <div class="app">
+    <div class="sidebar">
+      <div class="sidebar-logo">ASTERIA</div>
+      <div class="sidebar-tagline">Dofus Retro 1.43.7</div>
+
+      <div class="nav-item active"><span class="nav-icon">▶</span> Jouer</div>
+
+      <div class="nav-section-label">Contenu</div>
+      <div class="nav-item" data-page="/actualites"><span class="nav-icon">📰</span> Patch Notes</div>
+      <div class="nav-item" data-page="/classement"><span class="nav-icon">🏆</span> Classements</div>
+      <div class="nav-item" data-page="/vote"><span class="nav-icon">🗳</span> Vote</div>
+      <div class="nav-item" data-page="/boutique"><span class="nav-icon">🛒</span> Boutique</div>
+
+      <div class="nav-section-label">Communaute</div>
+      <div class="nav-item" id="discord-item"><span class="nav-icon">💬</span> Discord</div>
+      <div class="nav-item" data-page="/wiki"><span class="nav-icon">📖</span> Wiki</div>
+      <div class="nav-item locked"><span class="nav-icon">🔒</span> Joueurs</div>
+
+      <div class="sidebar-footer">
+        <div class="server-line">
+          <span class="server-dot" id="server-dot"></span>
+          <span id="server-text">Etat du serveur : ...</span>
+        </div>
+        <div id="version-line">Launcher</div>
+      </div>
+    </div>
+
+    <div class="main">
+      <div class="stars"></div>
+      <div class="logo">ASTERIA</div>
+      <div class="subtitle">DOFUS RETRO — 1.43.7</div>
+
+      <div class="players-badge">
+        <span id="server-dot-2" class="server-dot"></span>
+        <span id="players-text">... joueurs en ligne</span>
+      </div>
+
+      <div class="flavor-text" id="flavor-text"></div>
+
+      <div id="status-message">Initialisation...</div>
+      <div class="progress-track">
+        <div id="progress-fill"></div>
+      </div>
+
+      <button id="play-btn" disabled>PATIENTE...</button>
+    </div>
+  </div>
+
+  <script>
+    const FLAVOR_LINES = [
+      "Le Gardien des Donjons attend les temeraires aux portes d'Asteria.",
+      "Une poussiere d'etoile scintille pres du Sanctuaire des Dragoeufs.",
+      "Les Sentinelles Astrales veillent, meme quand personne ne regarde.",
+      "Quelque part dans le Chene Mou, une salle attend d'etre exploree.",
+      "L'Oracle des Constellations n'a jamais tort... ou presque.",
+      "Vingt paliers de prestige separent l'etincelle naissante de l'avatar d'Asteria.",
+    ];
+    document.getElementById('flavor-text').textContent =
+      FLAVOR_LINES[Math.floor(Math.random() * FLAVOR_LINES.length)];
+
+    const statusEl = document.getElementById('status-message');
+    const progressEl = document.getElementById('progress-fill');
+    const playBtn = document.getElementById('play-btn');
+    const serverDot = document.getElementById('server-dot');
+    const serverDot2 = document.getElementById('server-dot-2');
+    const serverText = document.getElementById('server-text');
+    const playersText = document.getElementById('players-text');
+
+    document.getElementById('close-btn').addEventListener('click', () => window.asteria.closeLauncher());
+    document.getElementById('minimize-btn').addEventListener('click', () => window.asteria.minimizeLauncher());
+    document.getElementById('discord-item').addEventListener('click', () => window.asteria.openDiscord());
+
+    document.querySelectorAll('.nav-item[data-page]').forEach((el) => {
+      el.addEventListener('click', () => window.asteria.openSitePage(el.dataset.page));
+    });
+
+    let currentPhase = 'checking';
+
+    playBtn.addEventListener('click', () => {
+      if (playBtn.disabled) return;
+      if (currentPhase === 'error') window.asteria.retryInit();
+      else if (currentPhase === 'integrity-error') window.asteria.requestRepair();
+      else window.asteria.requestPlay();
+    });
+
+    const versionLine = document.getElementById('version-line');
+    function showVersions({ launcher, client }) {
+      versionLine.textContent = 'Launcher v' + launcher + (client ? ' · Client ' + client : '');
+    }
+    window.asteria.onVersions(showVersions);
+    window.asteria.getVersions().then(showVersions).catch(() => {});
+
+    window.asteria.onStatus(({ phase, message, percent }) => {
+      currentPhase = phase;
+      statusEl.textContent = message;
+      progressEl.style.background = 'linear-gradient(90deg, var(--color-primary), var(--color-accent))';
+
+      if (typeof percent === 'number') {
+        progressEl.style.width = percent + '%';
+      } else if (phase === 'checking') {
+        progressEl.style.width = '0%';
+      } else if (phase === 'ready' || phase === 'launching') {
+        progressEl.style.width = '100%';
+      }
+
+      if (phase === 'ready') {
+        playBtn.disabled = false;
+        playBtn.textContent = 'JOUER';
+      } else if (phase === 'launching') {
+        playBtn.disabled = true;
+        playBtn.textContent = 'LANCEMENT...';
+      } else if (phase === 'verifying') {
+        playBtn.disabled = true;
+        playBtn.textContent = 'VERIFICATION...';
+      } else if (phase === 'error') {
+        playBtn.disabled = false;
+        playBtn.textContent = 'REESSAYER';
+        progressEl.style.background = 'var(--color-red)';
+      } else if (phase === 'integrity-error') {
+        playBtn.disabled = false;
+        playBtn.textContent = 'REPARER LE CLIENT';
+        progressEl.style.width = '100%';
+        progressEl.style.background = 'var(--color-red)';
+      } else if (phase === 'launcher-update') {
+        playBtn.disabled = true;
+        playBtn.textContent = 'MISE A JOUR...';
+      } else {
+        playBtn.disabled = true;
+        playBtn.textContent = 'PATIENTE...';
+      }
+    });
+
+    window.asteria.onServerInfo(({ online, playersOnline }) => {
+      serverDot.className = 'server-dot ' + (online ? 'online' : 'offline');
+      serverDot2.className = 'server-dot ' + (online ? 'online' : 'offline');
+      serverText.textContent = 'Etat du serveur : ' + (online ? 'En ligne' : 'Hors ligne');
+      playersText.textContent =
+        typeof playersOnline === 'number' ? playersOnline + ' joueurs en ligne' : 'Effectif indisponible';
+    });
+  </script>
+</body>
+</html>
