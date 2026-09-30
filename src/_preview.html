@@ -1,9 +1,17 @@
 <!DOCTYPE html>
+<!-- FICHIER GENERE — ne pas modifier a la main.
+     Copie de index.html sans la CSP et avec _preview-mock.js, pour regarder l'interface dans un
+     navigateur (npx http-server src, ou la configuration « apercu-launcher » de .claude/launch.json)
+     sans lancer Electron ni toucher au client installe. A regenerer apres toute modification de
+     index.html :
+       python -c "import io;s=io.open('src/index.html',encoding='utf-8').read();import re;s=re.sub(r'<meta http-equiv=\"Content-Security-Policy\"[\s\S]*?/>','',s);s=s.replace('<script src=\"i18n.js\"></script>','<script src=\"i18n.js\"></script>
+  <script src=\"_preview-mock.js\"></script>');io.open('src/_preview.html','w',encoding='utf-8',newline='
+').write(s)"
+     Exclu du build par le motif !src/_preview* de package.json. -->
 <html lang="fr">
 <head>
 <meta charset="UTF-8" />
-<meta http-equiv="Content-Security-Policy"
-      content="default-src 'none'; img-src 'self' data:; style-src 'self'; script-src 'self'; media-src 'self'" />
+
 <title>Asteria Launcher</title>
 <link rel="stylesheet" href="styles.css" />
 </head>
@@ -356,6 +364,7 @@
   </div>
 
   <script src="i18n.js"></script>
+  <script src="_preview-mock.js"></script>
   <script src="renderer.js"></script>
 </body>
 </html>

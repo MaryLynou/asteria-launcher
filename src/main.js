@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, dialog, Tray, Menu, Notification } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const https = require('https');
@@ -8,17 +8,22 @@ const { spawn } = require('child_process');
 const extractZip = require('extract-zip');
 const { autoUpdater } = require('electron-updater');
 const config = require('./config');
+const i18n = require('./i18n');
+const { Settings, WINDOW_SIZES } = require('./settings');
 
 // Surcharges de test (uniquement hors build empaquete) : dossier d'installation et tag de release cible.
 const devInstallDir = !app.isPackaged && process.env.ASTERIA_INSTALL_DIR;
 const devReleaseTag = !app.isPackaged && process.env.ASTERIA_RELEASE_TAG;
 const devAutoQuit = !app.isPackaged && process.env.ASTERIA_AUTOQUIT === '1';
+// Garde-fou pour travailler sur l'interface : le launcher verifie et annonce les mises a jour,
+// mais ne telecharge ni n'ecrit rien. Sans elle, un simple `electron .` sur un client en retard
+// lance une vraie mise a jour de plusieurs Go sur le dossier de jeu. Voir `npm run dev`.
+const devNoDownload = !app.isPackaged && process.env.ASTERIA_NO_DOWNLOAD === '1';
 
-const installDir = devInstallDir || path.join(app.getPath('appData'), config.installDirName, 'client');
-const versionFile = path.join(installDir, 'version.txt');
 const tempZipPath = path.join(app.getPath('temp'), 'asteria-client-update.zip');
 const tempPatchPath = path.join(app.getPath('temp'), 'asteria-client-patch.zip');
 const manifestFile = path.join(app.getPath('userData'), 'client-manifest.json');
+const settingsFile = path.join(app.getPath('userData'), 'settings.json');
 
 // Fichiers ecrits par le launcher lui-meme, pas par la distribution du client :
 // on ne les inclut pas dans le controle d'integrite.
@@ -26,10 +31,59 @@ const INTEGRITY_EXCLUDE = new Set(['version.txt']);
 // Fichier de metadonnees livre a la racine d'un patch differentiel (liste des suppressions).
 const PATCH_META_NAME = '_patch.json';
 
+let settings;
 let mainWindow;
+let tray = null;
 let clientReady = false;
+let quitting = false;
+let gameProcess = null;
+let pendingUpdateVersion = null; // version distante connue quand les mises a jour auto sont coupees
+let serverWasOnline = null;
 
-// Journal de bord (userData/launcher.log, ~1 Mo puis rotation) : a demander aux joueurs en cas de souci.
+// ---------------------------------------------------------------------------------------------
+// Chemins : le dossier d'installation est un reglage, tout le reste en decoule.
+// ---------------------------------------------------------------------------------------------
+
+function defaultInstallDir() {
+  return path.join(app.getPath('appData'), config.installDirName, 'client');
+}
+
+function getInstallDir() {
+  return devInstallDir || (settings && settings.get('installDir')) || defaultInstallDir();
+}
+
+function getVersionFile() {
+  return path.join(getInstallDir(), 'version.txt');
+}
+
+/**
+ * Chemin de l'executable pour une architecture, ou null s'il n'est pas livre. Les entrees de
+ * config sont des chemins relatifs au dossier d'installation, separes par des barres obliques :
+ * le 32 bits est le projecteur Flash range dans resources/app/retroclient.
+ */
+function exePathForArch(arch) {
+  const dir = getInstallDir();
+  for (const relatif of config.clientExeByArch[arch] || []) {
+    const complet = path.join(dir, ...relatif.split('/'));
+    if (fs.existsSync(complet)) return complet;
+  }
+  return null;
+}
+
+/** Ce que le client installe propose reellement : sert a griser l'option indisponible. */
+function archAvailability() {
+  return { x64: !!exePathForArch('x64'), x86: !!exePathForArch('x86') };
+}
+
+function anyExeExists() {
+  return !!(exePathForArch('x64') || exePathForArch('x86'));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Journal de bord (userData/launcher.log, ~1 Mo puis rotation) : a demander aux joueurs.
+// Il est toujours ecrit en francais, quelle que soit la langue de l'interface.
+// ---------------------------------------------------------------------------------------------
+
 const logFile = path.join(app.getPath('userData'), 'launcher.log');
 function logLine(level, ...parts) {
   const text = parts.map((p) => (p instanceof Error ? p.message : String(p))).join(' ');
@@ -44,54 +98,150 @@ function logLine(level, ...parts) {
   (level === 'ERROR' ? console.error : console.log)(text);
 }
 
+const t = (cle, params) => i18n.translate(settings ? settings.get('lang') : 'fr', cle, params);
+
+// ---------------------------------------------------------------------------------------------
+// Fenetre
+// ---------------------------------------------------------------------------------------------
+
 function createWindow() {
+  const taille = WINDOW_SIZES[settings.get('windowSize')] || WINDOW_SIZES.medium;
   mainWindow = new BrowserWindow({
-    width: 1000,
-    height: 640,
+    width: taille.width,
+    height: taille.height,
     resizable: false,
     frame: false,
-    backgroundColor: '#05060f',
+    backgroundColor: '#04061a',
+    show: false,
     icon: path.join(__dirname, '..', 'build', 'icon.ico'),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
     },
   });
   mainWindow.loadFile(path.join(__dirname, 'index.html'));
+
+  // Fermer la fenetre peut vouloir dire « ranger dans la zone de notification ».
+  mainWindow.on('close', (event) => {
+    if (!quitting && settings.get('minimizeToTray')) {
+      event.preventDefault();
+      mainWindow.hide();
+    }
+  });
+
   mainWindow.once('ready-to-show', () => {
     mainWindow.show();
-    logLine('INFO', 'launcher', app.getVersion(), '| client dir', installDir, '| client', getLocalVersion() || 'aucun');
+    logLine('INFO', 'launcher', app.getVersion(), '| client dir', getInstallDir(), '| client', getLocalVersion() || 'aucun');
     initialize().catch((err) => {
-      sendStatus('error', 'Erreur : ' + err.message);
+      sendStatus('error', 'error.generic', { message: err.message });
       logLine('ERROR', 'init', err);
       if (devAutoQuit) setTimeout(() => app.quit(), 500);
     });
     pollServerInfo();
     setInterval(pollServerInfo, 30000);
+    refreshNews();
+    setInterval(refreshNews, 10 * 60 * 1000);
   });
 }
 
-function sendStatus(phase, message, percent) {
-  if (typeof percent !== 'number' || percent === 0 || percent === 100) logLine('INFO', phase, '-', message);
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('status', { phase, message, percent });
+function appliquerTray() {
+  const voulu = settings.get('minimizeToTray');
+  if (voulu && !tray) {
+    try {
+      tray = new Tray(path.join(__dirname, '..', 'build', 'icon.ico'));
+      tray.setToolTip('Asteria Launcher');
+      construireMenuTray();
+      tray.on('double-click', montrerFenetre);
+    } catch (e) {
+      logLine('ERROR', 'tray indisponible :', e);
+      tray = null;
+    }
+  } else if (!voulu && tray) {
+    tray.destroy();
+    tray = null;
+  } else if (tray) {
+    construireMenuTray();
   }
+}
+
+function construireMenuTray() {
+  if (!tray) return;
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: t('dialog.tray.open'), click: montrerFenetre },
+      { label: t('dialog.tray.play'), enabled: clientReady, click: () => demanderLancement() },
+      { type: 'separator' },
+      { label: t('dialog.tray.quit'), click: () => { quitting = true; app.quit(); } },
+    ])
+  );
+}
+
+function montrerFenetre() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (!mainWindow.isVisible()) mainWindow.show();
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.focus();
+}
+
+function notifier(cleReglage, titreCle, corpsCle, params) {
+  if (!settings.get(cleReglage)) return;
+  if (!Notification.isSupported()) return;
+  try {
+    new Notification({
+      title: t(titreCle, params),
+      body: t(corpsCle, params),
+      icon: path.join(__dirname, '..', 'build', 'icon.ico'),
+    }).show();
+  } catch (e) {
+    // une notification ratee n'est jamais bloquante
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Messages vers l'interface : cle + parametres, jamais du texte tout fait, pour que le
+// changement de langue s'applique sans relancer quoi que ce soit.
+// ---------------------------------------------------------------------------------------------
+
+let dernierStatut = null;
+// Un telechargement emet un evenement par bloc recu, soit des centaines par seconde : le journal
+// ne retient qu'un palier tous les 10 %, plus chaque changement de message.
+let journalPrecedent = { texte: null, percent: -100 };
+
+function sendStatus(phase, cle, params, percent) {
+  dernierStatut = { phase, key: cle, params: params || null, percent };
+
+  const texte = i18n.translate('fr', cle, params);
+  const chiffre = typeof percent === 'number';
+  if (texte !== journalPrecedent.texte || !chiffre || percent === 100 || percent - journalPrecedent.percent >= 10) {
+    logLine('INFO', phase, '-', texte + (chiffre ? ' (' + percent + ' %)' : ''));
+    journalPrecedent = { texte, percent: chiffre ? percent : -100 };
+  }
+
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('status', dernierStatut);
+  if (tray) construireMenuTray();
 }
 
 function sendServerInfo(info) {
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('server-info', info);
-  }
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('server-info', info);
+}
+
+function etatComplet() {
+  return {
+    launcher: app.getVersion(),
+    client: getLocalVersion(),
+    installDir: getInstallDir(),
+    arch: archAvailability(),
+    running: !!gameProcess,
+    pendingUpdate: pendingUpdateVersion,
+  };
 }
 
 function sendVersions() {
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('versions', { launcher: app.getVersion(), client: getLocalVersion() });
-  }
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('versions', etatComplet());
 }
 
 function getLocalVersion() {
   try {
-    return fs.readFileSync(versionFile, 'utf8').trim();
+    return fs.readFileSync(getVersionFile(), 'utf8').trim();
   } catch (e) {
     return null;
   }
@@ -103,6 +253,10 @@ function formatSize(bytes) {
   if (bytes >= 1024 * 1024) return Math.round(bytes / (1024 * 1024)) + ' Mo';
   return Math.max(1, Math.round(bytes / 1024)) + ' Ko';
 }
+
+// ---------------------------------------------------------------------------------------------
+// Reseau
+// ---------------------------------------------------------------------------------------------
 
 function fetchJson(url, extraHeaders) {
   return new Promise((resolve, reject) => {
@@ -143,10 +297,14 @@ function downloadFile(url, destPath, onProgress) {
         }
         const total = parseInt(res.headers['content-length'] || '0', 10);
         let downloaded = 0;
+        const debut = Date.now();
         const fileStream = fs.createWriteStream(destPath);
         res.on('data', (chunk) => {
           downloaded += chunk.length;
-          if (total > 0 && onProgress) onProgress(downloaded / total);
+          if (total > 0 && onProgress) {
+            const secondes = Math.max(0.001, (Date.now() - debut) / 1000);
+            onProgress(downloaded / total, downloaded / secondes);
+          }
         });
         res.pipe(fileStream);
         fileStream.on('finish', () => fileStream.close(() => resolve()));
@@ -175,14 +333,16 @@ function checkGameServerOnline(timeoutMs) {
   });
 }
 
+function supabase(chemin) {
+  return fetchJson(config.supabaseUrl + chemin, {
+    apikey: config.supabaseAnonKey,
+    Authorization: 'Bearer ' + config.supabaseAnonKey,
+  });
+}
+
 async function fetchPlayersOnline() {
   try {
-    const url =
-      config.supabaseUrl + '/rest/v1/server_status?id=eq.1&select=is_online,players_online';
-    const rows = await fetchJson(url, {
-      apikey: config.supabaseAnonKey,
-      Authorization: 'Bearer ' + config.supabaseAnonKey,
-    });
+    const rows = await supabase('/rest/v1/server_status?id=eq.1&select=is_online,players_online');
     const row = Array.isArray(rows) ? rows[0] : null;
     return row ? row.players_online : null;
   } catch (e) {
@@ -191,11 +351,44 @@ async function fetchPlayersOnline() {
 }
 
 async function pollServerInfo() {
-  const [tcpOnline, playersOnline] = await Promise.all([
-    checkGameServerOnline(),
-    fetchPlayersOnline(),
-  ]);
-  sendServerInfo({ online: tcpOnline, playersOnline });
+  const [tcpOnline, playersOnline] = await Promise.all([checkGameServerOnline(), fetchPlayersOnline()]);
+  if (serverWasOnline === false && tcpOnline) notifier('notifyServerBack', 'notify.serverBack.title', 'notify.serverBack.body');
+  serverWasOnline = tcpOnline;
+  sendServerInfo({ online: tcpOnline, playersOnline, at: Date.now() });
+}
+
+let dernieresActus = [];
+
+async function refreshNews() {
+  try {
+    const posts = await supabase(
+      '/rest/v1/news_posts?select=slug,title,excerpt,published_at&published_at=not.is.null' +
+        '&order=published_at.desc&limit=4'
+    );
+    if (!Array.isArray(posts)) return;
+    dernieresActus = posts;
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('news', posts);
+
+    // Le corps de la notification est le titre de l'actualite : il vient du site, pas d'une cle.
+    // Au tout premier lancement `lastSeenNews` est vide — on enregistre sans notifier, sinon on
+    // annoncerait comme nouvelle une actualite deja vieille de plusieurs semaines.
+    const dernier = posts[0] && posts[0].slug;
+    const connu = settings.get('lastSeenNews');
+    if (dernier && connu && dernier !== connu && settings.get('notifyNews') && Notification.isSupported()) {
+      try {
+        new Notification({
+          title: t('notify.news.title'),
+          body: posts[0].title,
+          icon: path.join(__dirname, '..', 'build', 'icon.ico'),
+        }).show();
+      } catch (e) {
+        // une notification ratee n'est jamais bloquante
+      }
+    }
+    if (dernier && dernier !== connu) settings.set('lastSeenNews', dernier);
+  } catch (e) {
+    // pas d'actualites : le panneau reste vide, ce n'est pas une erreur bloquante
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -213,18 +406,14 @@ function listFilesRecursive(dir) {
   }
   for (const entry of entries) {
     const fullPath = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      results.push(...listFilesRecursive(fullPath));
-    } else if (entry.isFile()) {
-      results.push(fullPath);
-    }
+    if (entry.isDirectory()) results.push(...listFilesRecursive(fullPath));
+    else if (entry.isFile()) results.push(fullPath);
   }
   return results;
 }
 
 function hashFile(filePath) {
-  const data = fs.readFileSync(filePath);
-  return crypto.createHash('sha256').update(data).digest('hex');
+  return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
 }
 
 function buildManifest(dir) {
@@ -252,17 +441,18 @@ function baselineFromPublished(published) {
 // mise a jour interrompue), elle est ignoree et retelechargee avec la release.
 function writeBaseline(baseline) {
   fs.mkdirSync(path.dirname(manifestFile), { recursive: true });
-  fs.writeFileSync(manifestFile, JSON.stringify({ version: getLocalVersion(), files: baseline }), 'utf8');
+  fs.writeFileSync(manifestFile, JSON.stringify({ version: getLocalVersion(), dir: getInstallDir(), files: baseline }), 'utf8');
 }
 
 function saveManifestBaseline(published) {
-  writeBaseline(published ? baselineFromPublished(published) : buildManifest(installDir));
+  writeBaseline(published ? baselineFromPublished(published) : buildManifest(getInstallDir()));
 }
 
 function loadManifestBaseline() {
   try {
     const stored = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
     if (!stored || !stored.files || stored.version !== getLocalVersion()) return null;
+    if (stored.dir && stored.dir !== getInstallDir()) return null;
     return stored.files;
   } catch (e) {
     return null;
@@ -270,7 +460,7 @@ function loadManifestBaseline() {
 }
 
 function compareWithBaseline(baseline) {
-  const current = buildManifest(installDir);
+  const current = buildManifest(getInstallDir());
   const modified = [];
   const added = [];
   const missing = [];
@@ -281,20 +471,12 @@ function compareWithBaseline(baseline) {
   for (const rel of Object.keys(current)) {
     if (!(rel in baseline)) added.push(rel);
   }
-  return {
-    ok: modified.length === 0 && added.length === 0 && missing.length === 0,
-    noBaseline: false,
-    modified,
-    added,
-    missing,
-  };
+  return { ok: !modified.length && !added.length && !missing.length, noBaseline: false, modified, added, missing };
 }
 
 function verifyIntegrity() {
   const baseline = loadManifestBaseline();
-  if (!baseline) {
-    return { ok: false, noBaseline: true, modified: [], added: [], missing: [] };
-  }
+  if (!baseline) return { ok: false, noBaseline: true, modified: [], added: [], missing: [] };
   return compareWithBaseline(baseline);
 }
 
@@ -302,8 +484,9 @@ function verifyIntegrity() {
 // puis les dossiers devenus vides. Le dossier d'installation reflete ainsi exactement la release.
 function pruneToManifest(published) {
   const baseline = baselineFromPublished(published);
-  for (const file of listFilesRecursive(installDir)) {
-    const rel = path.relative(installDir, file).split(path.sep).join('/');
+  const dir = getInstallDir();
+  for (const file of listFilesRecursive(dir)) {
+    const rel = path.relative(dir, file).split(path.sep).join('/');
     if (INTEGRITY_EXCLUDE.has(rel) || rel in baseline) continue;
     try {
       fs.unlinkSync(file);
@@ -311,7 +494,7 @@ function pruneToManifest(published) {
       // ignore
     }
   }
-  removeEmptyDirs(installDir);
+  removeEmptyDirs(dir);
 }
 
 // True si le dossier ne contient aucun fichier (recursivement) : simple lecture, aucune suppression.
@@ -332,8 +515,8 @@ function hasNoFiles(dir) {
   return true;
 }
 
-// Liste les sous-arborescences sans aucun fichier (restes d'anciennes versions) : on ne garde que
-// les racines de ces arborescences, chacune est ensuite supprimee d'un seul appel recursif.
+// Liste les sous-arborescences sans aucun fichier : on ne garde que les racines, chacune est
+// ensuite supprimee d'un seul appel recursif.
 function findEmptySubtrees(dir, out) {
   let entries;
   try {
@@ -350,8 +533,8 @@ function findEmptySubtrees(dir, out) {
   return out;
 }
 
-// Sur Windows la suppression des fichiers peut etre differee (antivirus, indexation) : rm reessaie
-// quelques fois plutot que de laisser des dossiers vides derriere nous.
+// Sur Windows la suppression peut etre differee (antivirus, indexation) : rm reessaie quelques
+// fois plutot que de laisser des dossiers vides derriere nous.
 function removeEmptyDirs(dir) {
   for (const sub of findEmptySubtrees(dir, [])) {
     try {
@@ -362,7 +545,6 @@ function removeEmptyDirs(dir) {
   }
 }
 
-// Variante asynchrone pour le nettoyage de fond au demarrage (n'immobilise pas l'interface).
 async function removeEmptyDirsAsync(dir) {
   for (const sub of findEmptySubtrees(dir, [])) {
     try {
@@ -373,17 +555,17 @@ async function removeEmptyDirsAsync(dir) {
   }
 }
 
-// Applique le fichier _patch.json extrait avec un patch differentiel : suppressions de fichiers
+// Applique le fichier _patch.json livre avec un patch differentiel : suppressions de fichiers
 // retires de la version cible.
 function applyPatchMeta() {
-  const metaPath = path.join(installDir, PATCH_META_NAME);
+  const dir = getInstallDir();
+  const metaPath = path.join(dir, PATCH_META_NAME);
   if (!fs.existsSync(metaPath)) return;
   try {
     const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
     for (const rel of meta.deleted || []) {
-      const target = path.join(installDir, rel);
-      // securite : jamais en dehors du dossier d'installation
-      if (!target.startsWith(installDir)) continue;
+      const target = path.join(dir, rel);
+      if (!target.startsWith(dir)) continue; // securite : jamais en dehors du dossier d'installation
       try {
         fs.unlinkSync(target);
       } catch (e) {
@@ -429,21 +611,27 @@ function checkLauncherUpdate() {
     });
     autoUpdater.on('update-not-available', () => done(false));
     autoUpdater.on('update-available', (info) => {
-      // La verification est faite : on laisse le telechargement aller a son terme.
       if (checkTimer) clearTimeout(checkTimer);
-      sendStatus('launcher-update', 'Mise a jour du launcher (' + info.version + ')...', 0);
+      notifier('notifyUpdateAvailable', 'notify.updateAvailable.title', 'notify.updateAvailable.body', {
+        version: info.version,
+      });
+      sendStatus('launcher-update', 'status.launcherUpdate', { version: info.version }, 0);
     });
     autoUpdater.on('download-progress', (progress) => {
       sendStatus(
         'launcher-update',
-        'Mise a jour du launcher (' + Math.round(progress.percent) + '%)...',
+        'status.launcherUpdateProgress',
+        { percent: Math.round(progress.percent) },
         Math.round(progress.percent)
       );
     });
     autoUpdater.on('update-downloaded', () => {
-      sendStatus('launcher-update', 'Redemarrage du launcher...', 100);
+      sendStatus('launcher-update', 'status.launcherRestart', null, 100);
       done(true);
-      setTimeout(() => autoUpdater.quitAndInstall(true, true), 1200);
+      setTimeout(() => {
+        quitting = true;
+        autoUpdater.quitAndInstall(true, true);
+      }, 1200);
     });
 
     // Si la simple verification ne repond pas (hors ligne, GitHub indisponible), on continue.
@@ -455,8 +643,8 @@ function checkLauncherUpdate() {
 // ---------------------------------------------------------------------------------------------
 // Mise a jour du client (releases GitHub du depot asteria-client).
 // Une release publie : asteria-client.zip (complet), manifest.json (empreintes) et, en general,
-// patch-from-<version precedente>.asteriapatch (zip des fichiers modifies + _patch.json). Le launcher
-// applique le patch quand il correspond a la version locale, sinon il retelecharge le zip complet.
+// patch-from-<version precedente>.asteriapatch. Le launcher applique le patch quand il correspond
+// a la version locale, sinon il retelecharge le zip complet.
 // ---------------------------------------------------------------------------------------------
 
 function fetchRelease() {
@@ -477,28 +665,31 @@ async function fetchManifest(asset) {
 
 async function ensureBaseline(manifestAsset) {
   if (loadManifestBaseline()) return;
-  const manifest = await fetchManifest(manifestAsset);
-  saveManifestBaseline(manifest);
+  saveManifestBaseline(await fetchManifest(manifestAsset));
 }
 
 async function initialize(options) {
   const forceFull = !!(options && options.forceFull);
+  // Les mises a jour auto peuvent etre coupees, mais une premiere installation reste obligatoire :
+  // sans client il n'y a rien a lancer.
+  const autoriseTelechargement =
+    !devNoDownload &&
+    (forceFull || !!(options && options.force) || settings.get('autoUpdate') || !getLocalVersion());
+
+  pendingUpdateVersion = null;
   sendVersions();
-  sendStatus('checking', 'Verification des mises a jour...');
+  sendStatus('checking', 'status.checkingLauncher');
 
   if (await checkLauncherUpdate()) return; // le launcher redemarre avec la nouvelle version
 
-  sendStatus('checking', 'Verification des mises a jour du client...');
+  sendStatus('checking', 'status.checkingClient');
 
   let release = null;
   try {
     release = await fetchRelease();
   } catch (err) {
-    const localVersion = getLocalVersion();
-    if (localVersion && !forceFull) {
-      return finishReady('Hors ligne, version locale disponible.');
-    }
-    throw new Error('Impossible de verifier les mises a jour et aucune installation locale trouvee.');
+    if (getLocalVersion() && !forceFull) return finishReady('status.readyOffline');
+    throw new Error(t('error.noRelease'));
   }
 
   const remoteVersion = release.tag_name;
@@ -508,12 +699,27 @@ async function initialize(options) {
   const fullAsset = assets.find(
     (a) => a.name.toLowerCase().endsWith('.zip') && !a.name.toLowerCase().startsWith('patch-from-')
   );
-  const exeExists = fs.existsSync(path.join(installDir, config.clientExeName));
+  const exeExists = anyExeExists();
 
   if (!forceFull && localVersion === remoteVersion && exeExists) {
     await ensureBaseline(manifestAsset);
-    removeEmptyDirsAsync(installDir).catch(() => {});
-    return finishReady('A jour !');
+    removeEmptyDirsAsync(getInstallDir()).catch(() => {});
+    return finishReady('status.ready');
+  }
+
+  // Une mise a jour existe : on previent, puis on la telecharge — ou on attend le clic si les
+  // mises a jour automatiques sont coupees.
+  if (localVersion && localVersion !== remoteVersion) {
+    notifier('notifyUpdateAvailable', 'notify.updateAvailable.title', 'notify.updateAvailable.body', {
+      version: remoteVersion,
+    });
+  }
+  if (!autoriseTelechargement) {
+    pendingUpdateVersion = remoteVersion;
+    clientReady = false;
+    sendVersions();
+    sendStatus('update-available', 'status.updateAvailable', { version: remoteVersion });
+    return;
   }
 
   const manifest = await fetchManifest(manifestAsset);
@@ -527,34 +733,47 @@ async function initialize(options) {
   if (patchAsset) {
     try {
       await applyPatch(patchAsset, manifest, remoteVersion);
-      return finishReady('Mise a jour ' + remoteVersion + ' installee !');
+      return finishReady('status.readyUpdated', { version: remoteVersion }, true);
     } catch (err) {
       logLine('ERROR', 'patch impossible, retour au telechargement complet :', err);
-      sendStatus('checking', 'Mise a jour rapide impossible, telechargement complet...');
+      sendStatus('checking', 'status.fallbackFull');
     }
   }
 
   // 2) Installation complete (premiere installation, saut de plusieurs versions, reparation)
   if (!fullAsset) {
-    if (localVersion && !forceFull) {
-      return finishReady('Pas de fichier de mise a jour, version locale disponible.');
-    }
-    throw new Error('Aucun fichier client disponible sur la derniere version publiee.');
+    if (localVersion && !forceFull) return finishReady('status.readyNoAsset');
+    throw new Error(t('error.noAsset'));
   }
 
+  const premiereInstallation = !localVersion;
   await installFull(fullAsset, manifest, remoteVersion, forceFull);
-  return finishReady(forceFull ? 'Client repare !' : 'Installation terminee !');
+  return finishReady(
+    forceFull ? 'status.readyRepaired' : premiereInstallation ? 'status.readyInstalled' : 'status.readyUpdated',
+    { version: remoteVersion },
+    true
+  );
+}
+
+function progression(cle, params) {
+  return (fraction, octetsParSeconde) => {
+    const percent = Math.round(fraction * 100);
+    sendStatus(
+      'downloading',
+      cle,
+      Object.assign({ speed: formatSize(octetsParSeconde) + '/s' }, params),
+      percent
+    );
+  };
 }
 
 async function applyPatch(patchAsset, manifest, remoteVersion) {
-  const label = 'Telechargement de la mise a jour ' + remoteVersion + ' (' + formatSize(patchAsset.size) + ')...';
-  sendStatus('downloading', label, 0);
-  await downloadFile(patchAsset.browser_download_url, tempPatchPath, (fraction) => {
-    sendStatus('downloading', label, Math.round(fraction * 100));
-  });
+  const params = { version: remoteVersion, size: formatSize(patchAsset.size) };
+  sendStatus('downloading', 'status.downloadPatch', params, 0);
+  await downloadFile(patchAsset.browser_download_url, tempPatchPath, progression('status.downloadPatch', params));
 
-  sendStatus('extracting', 'Application de la mise a jour...');
-  await extractZip(tempPatchPath, { dir: installDir });
+  sendStatus('extracting', 'status.applyPatch');
+  await extractZip(tempPatchPath, { dir: getInstallDir() });
   applyPatchMeta();
   try {
     fs.unlinkSync(tempPatchPath);
@@ -563,60 +782,63 @@ async function applyPatch(patchAsset, manifest, remoteVersion) {
   }
 
   if (manifest) {
-    sendStatus('verifying', 'Verification des fichiers...');
+    sendStatus('verifying', 'status.verifyingFiles');
     pruneToManifest(manifest);
     const check = compareWithBaseline(baselineFromPublished(manifest));
     if (!check.ok) {
       throw new Error(
-        'verification apres patch : ' +
-          check.modified.length + ' modifie(s), ' + check.missing.length + ' manquant(s), ' + check.added.length + ' en trop'
+        t('error.patchMismatch', {
+          detail:
+            check.modified.length + ' modif., ' + check.missing.length + ' manq., ' + check.added.length + ' en trop',
+        })
       );
     }
   }
 
-  fs.writeFileSync(versionFile, remoteVersion, 'utf8');
+  fs.writeFileSync(getVersionFile(), remoteVersion, 'utf8');
   saveManifestBaseline(manifest);
   sendVersions();
 }
 
 async function installFull(fullAsset, manifest, remoteVersion, isRepair) {
-  const label =
-    (isRepair ? 'Reparation du client ' : 'Telechargement du client ') +
-    remoteVersion + ' (' + formatSize(fullAsset.size) + ')...';
-  sendStatus('downloading', label, 0);
-  await downloadFile(fullAsset.browser_download_url, tempZipPath, (fraction) => {
-    sendStatus('downloading', label, Math.round(fraction * 100));
-  });
+  const cle = isRepair ? 'status.repairFull' : 'status.downloadFull';
+  const params = { version: remoteVersion, size: formatSize(fullAsset.size) };
+  sendStatus('downloading', cle, params, 0);
+  await downloadFile(fullAsset.browser_download_url, tempZipPath, progression(cle, params));
 
-  sendStatus('extracting', 'Installation en cours...');
-  fs.mkdirSync(installDir, { recursive: true });
-  await extractZip(tempZipPath, { dir: installDir });
+  sendStatus('extracting', 'status.installing');
+  fs.mkdirSync(getInstallDir(), { recursive: true });
+  await extractZip(tempZipPath, { dir: getInstallDir() });
   try {
     fs.unlinkSync(tempZipPath);
   } catch (e) {
     // pas grave
   }
 
-  sendStatus('verifying', 'Verification des fichiers...');
+  sendStatus('verifying', 'status.verifyingFiles');
   if (manifest) {
     pruneToManifest(manifest);
     const check = compareWithBaseline(baselineFromPublished(manifest));
     if (!check.ok) {
       throw new Error(
-        'Le client telecharge ne correspond pas a la release (' +
-          check.modified.length + ' modifie(s), ' + check.missing.length + ' manquant(s)). Reessaie.'
+        t('error.downloadMismatch', {
+          detail: check.modified.length + ' modif., ' + check.missing.length + ' manq.',
+        })
       );
     }
   }
-  fs.writeFileSync(versionFile, remoteVersion, 'utf8');
+  fs.writeFileSync(getVersionFile(), remoteVersion, 'utf8');
   saveManifestBaseline(manifest);
   sendVersions();
 }
 
-function finishReady(message) {
+function finishReady(cle, params, apresInstallation) {
   clientReady = true;
-  sendStatus('ready', message);
-  logLine('INFO', 'ready :', message, '| client', getLocalVersion());
+  pendingUpdateVersion = null;
+  sendVersions();
+  sendStatus('ready', cle, params);
+  logLine('INFO', 'ready :', i18n.translate('fr', cle, params), '| client', getLocalVersion());
+  if (apresInstallation) notifier('notifyUpdateDone', 'notify.updateDone.title', 'notify.updateDone.body');
   if (devAutoQuit) {
     const check = verifyIntegrity();
     console.log('[integrity]', check.ok ? 'ok' : JSON.stringify(check));
@@ -624,81 +846,202 @@ function finishReady(message) {
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Lancement du jeu — le launcher ne se ferme plus, sauf si le joueur l'a demande.
+// ---------------------------------------------------------------------------------------------
+
 function launchClient() {
-  const exePath = path.join(installDir, config.clientExeName);
-  if (!fs.existsSync(exePath)) {
-    throw new Error("Le fichier du jeu (" + config.clientExeName + ') est introuvable apres installation.');
-  }
-  const child = spawn(exePath, [], {
-    cwd: installDir,
-    detached: true,
-    stdio: 'ignore',
+  const voulu = settings.get('arch');
+  const autre = voulu === 'x64' ? 'x86' : 'x64';
+  const exePath = exePathForArch(voulu) || exePathForArch(autre);
+  if (!exePath) throw new Error(t('error.noExe', { name: config.clientExeName }));
+  if (!exePathForArch(voulu)) logLine('INFO', 'version', voulu, 'absente, lancement de', path.basename(exePath));
+
+  // Le dossier courant est celui de l'executable, pas la racine : le projecteur Flash 32 bits
+  // charge loader.swf et ses ressources a cote de lui.
+  logLine('INFO', 'lancement', voulu, ':', exePath);
+  const child = spawn(exePath, [], { cwd: path.dirname(exePath), detached: true, stdio: 'ignore' });
+  gameProcess = child;
+  sendVersions();
+
+  child.on('exit', () => {
+    gameProcess = null;
+    sendVersions();
+    if (!quitting) sendStatus('ready', 'status.gameClosed');
+  });
+  child.on('error', (err) => {
+    gameProcess = null;
+    sendVersions();
+    sendStatus('error', 'error.generic', { message: err.message });
   });
   child.unref();
-  setTimeout(() => app.quit(), 800);
+
+  if (settings.get('closeOnLaunch')) {
+    setTimeout(() => {
+      quitting = true;
+      app.quit();
+    }, 800);
+  } else {
+    setTimeout(() => sendStatus('running', 'status.running'), 600);
+  }
 }
 
-ipcMain.on('request-play', () => {
+function demanderLancement() {
   if (!clientReady) return;
 
-  sendStatus('verifying', "Verification de l'integrite des fichiers...");
-
+  sendStatus('verifying', 'status.verifyingIntegrity');
   setTimeout(() => {
     try {
       const result = verifyIntegrity();
       if (!result.ok) {
         const details = [];
-        if (result.modified.length) details.push(result.modified.length + ' modifie(s)');
-        if (result.added.length) details.push(result.added.length + ' ajoute(s)');
-        if (result.missing.length) details.push(result.missing.length + ' manquant(s)');
-        const reason = result.noBaseline
-          ? 'aucune reference locale'
-          : details.join(', ');
-        sendStatus('integrity-error', 'Fichiers du client modifies (' + reason + ').');
+        if (result.modified.length) details.push(t('status.integrityModified', { n: result.modified.length }));
+        if (result.added.length) details.push(t('status.integrityAdded', { n: result.added.length }));
+        if (result.missing.length) details.push(t('status.integrityMissing', { n: result.missing.length }));
+        const reason = result.noBaseline ? t('status.integrityNoBaseline') : details.join(', ');
+        sendStatus('integrity-error', 'status.integrityError', { reason });
         return;
       }
-      sendStatus('launching', 'Lancement...');
+      sendStatus('launching', 'status.launching');
       launchClient();
     } catch (err) {
-      sendStatus('error', 'Erreur : ' + err.message);
+      sendStatus('error', 'error.generic', { message: err.message });
     }
   }, 50);
-});
+}
 
-ipcMain.on('retry-init', () => {
+// ---------------------------------------------------------------------------------------------
+// IPC
+// ---------------------------------------------------------------------------------------------
+
+function relance(options) {
   clientReady = false;
-  initialize().catch((err) => {
-    sendStatus('error', 'Erreur : ' + err.message);
+  initialize(options).catch((err) => {
+    sendStatus('error', 'error.generic', { message: err.message });
+    logLine('ERROR', 'init', err);
   });
+}
+
+ipcMain.on('request-play', demanderLancement);
+ipcMain.on('retry-init', () => relance());
+ipcMain.on('request-repair', () => relance({ forceFull: true }));
+ipcMain.on('check-updates', () => relance({ force: true }));
+
+ipcMain.handle('get-state', () => etatComplet());
+ipcMain.handle('get-settings', () => settings.tout());
+ipcMain.handle('get-news', () => dernieresActus);
+ipcMain.handle('get-status', () => dernierStatut);
+
+ipcMain.handle('set-setting', (_event, cle, valeur) => {
+  const retenu = settings.set(cle, valeur);
+
+  if (cle === 'minimizeToTray') appliquerTray();
+  if (cle === 'lang' && tray) construireMenuTray();
+  if (cle === 'startWithWindows' && app.isPackaged) {
+    app.setLoginItemSettings({ openAtLogin: !!retenu, args: ['--hidden'] });
+  }
+  if (cle === 'windowSize' && mainWindow && !mainWindow.isDestroyed()) {
+    const taille = WINDOW_SIZES[retenu] || WINDOW_SIZES.medium;
+    mainWindow.setSize(taille.width, taille.height);
+    mainWindow.center();
+  }
+  return settings.tout();
 });
 
-ipcMain.on('request-repair', () => {
+ipcMain.handle('choose-install-dir', async () => {
+  const res = await dialog.showOpenDialog(mainWindow, {
+    title: t('dialog.dir.title'),
+    message: t('dialog.dir.message'),
+    defaultPath: getInstallDir(),
+    properties: ['openDirectory', 'createDirectory'],
+  });
+  if (res.canceled || !res.filePaths.length) return { changed: false, dir: getInstallDir() };
+  settings.set('installDir', res.filePaths[0]);
+  logLine('INFO', "dossier d'installation :", res.filePaths[0]);
+  sendStatus('checking', 'status.dirChanged', { dir: res.filePaths[0] });
+  relance();
+  return { changed: true, dir: getInstallDir() };
+});
+
+ipcMain.handle('uninstall-client', async () => {
+  const dir = getInstallDir();
+  // Le dossier est choisi par le joueur : on ne supprime que s'il contient bien un client,
+  // jamais un dossier quelconque qui aurait ete designe par erreur.
+  if (!fs.existsSync(path.join(dir, 'version.txt')) && !anyExeExists()) {
+    return { done: false, reason: 'pas-un-client' };
+  }
+  const res = await dialog.showMessageBox(mainWindow, {
+    type: 'warning',
+    buttons: [t('dialog.uninstall.confirm'), t('button.cancel')],
+    defaultId: 1,
+    cancelId: 1,
+    title: t('dialog.uninstall.title'),
+    message: t('dialog.uninstall.message'),
+    detail: t('dialog.uninstall.detail', { dir }),
+  });
+  if (res.response !== 0) return { done: false, reason: 'annule' };
+
   clientReady = false;
-  initialize({ forceFull: true }).catch((err) => {
-    sendStatus('error', 'Erreur : ' + err.message);
-  });
+  try {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+    fs.rmSync(manifestFile, { force: true });
+  } catch (err) {
+    sendStatus('error', 'error.generic', { message: err.message });
+    return { done: false, reason: err.message };
+  }
+  logLine('INFO', 'client desinstalle :', dir);
+  sendVersions();
+  sendStatus('needs-install', 'status.uninstalled');
+  return { done: true };
 });
 
-ipcMain.handle('get-versions', () => ({ launcher: app.getVersion(), client: getLocalVersion() }));
-
-ipcMain.on('open-discord', () => {
-  if (config.discordUrl) shell.openExternal(config.discordUrl);
+ipcMain.on('open-game-folder', () => {
+  const dir = getInstallDir();
+  fs.mkdirSync(dir, { recursive: true });
+  shell.openPath(dir);
 });
-
+ipcMain.on('open-log', () => shell.openPath(logFile));
+ipcMain.on('open-discord', () => config.discordUrl && shell.openExternal(config.discordUrl));
+ipcMain.on('open-releases', () =>
+  shell.openExternal('https://github.com/' + config.githubOwner + '/' + config.githubRepo + '/releases')
+);
 ipcMain.on('open-site-page', (_event, pagePath) => {
   if (config.siteUrl) shell.openExternal(config.siteUrl.replace(/\/$/, '') + pagePath);
 });
 
-app.whenReady().then(createWindow);
-
-app.on('window-all-closed', () => {
-  app.quit();
-});
-
 ipcMain.on('close-launcher', () => {
+  if (settings.get('minimizeToTray') && tray) {
+    mainWindow.hide();
+    return;
+  }
+  quitting = true;
   app.quit();
 });
-
 ipcMain.on('minimize-launcher', () => {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.minimize();
+});
+
+// ---------------------------------------------------------------------------------------------
+// Demarrage
+// ---------------------------------------------------------------------------------------------
+
+// Une seule instance : relancer le raccourci ramene la fenetre au lieu d'ouvrir un doublon.
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on('second-instance', montrerFenetre);
+
+  app.whenReady().then(() => {
+    settings = new Settings(settingsFile, String(app.getLocale() || 'fr').slice(0, 2));
+    appliquerTray();
+    createWindow();
+  });
+}
+
+app.on('before-quit', () => {
+  quitting = true;
+});
+
+app.on('window-all-closed', () => {
+  if (!tray) app.quit();
 });

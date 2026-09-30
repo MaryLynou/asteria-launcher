@@ -1,6 +1,6 @@
 {
   "name": "asteria-launcher",
-  "version": "1.1.5",
+  "version": "1.2.0",
   "description": "Launcher officiel du serveur Asteria (Dofus Retro 1.43.7)",
   "main": "src/main.js",
   "author": "Asteria",
@@ -12,6 +12,8 @@
   },
   "scripts": {
     "start": "electron .",
+    "dev": "set ASTERIA_NO_DOWNLOAD=1&& electron .",
+    "preview": "python -m http.server 8123 --directory src",
     "build": "electron-builder --win --publish=never",
     "release": "electron-builder --win --publish always"
   },
@@ -37,6 +39,7 @@
     },
     "files": [
       "src/**/*",
+      "!src/_preview*",
       "assets/**/*"
     ],
     "win": {
